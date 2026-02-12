@@ -8,15 +8,47 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.db.models import ChatSession, ChatMessage
 from langchain_core.messages import AIMessage
+from pydantic import BaseModel
 
 router = APIRouter()
 
-@router.post("/chat/{session_id}")
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str
+
+@router.get("/sessions")
+async def get_all_sessions(db: Session = Depends(get_db)):
+    """
+    Fetches all unique chat sessions from the database.
+    """
+    sessions = db.query(ChatSession).order_by(ChatSession.updated_at.desc()).all()
+    return [
+        {"id": s.id, "title": s.title or f"Chat {s.id[:8]}", "updated_at": s.updated_at} 
+        for s in sessions
+    ]
+
+@router.get("/history/{session_id}")
+async def get_chat_history(session_id: str, db: Session = Depends(get_db)):
+    """
+    Returns all messages for a specific session to populate the frontend UI.
+    """
+    messages = db.query(ChatMessage).filter(
+        ChatMessage.session_id == session_id
+    ).order_by(ChatMessage.created_at.asc()).all()
+    
+    return [
+        {"role": m.role, "content": m.content, "created_at": m.created_at} 
+        for m in messages
+    ]
+
+@router.post("/chat")
 async def chat_with_agent(
-    session_id: str,
-    message: str = Body(..., embed=True),
+    request: ChatRequest,
     db: Session = Depends(get_db)
 ):
+    session_id = request.session_id
+    message = request.message
+    
     # 1. Fetch or Create Session
     chat_session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
     if not chat_session:
