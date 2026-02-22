@@ -1,14 +1,25 @@
-from fastapi import APIRouter, Body, Depends
+from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from app.services.agent import agent_app
 from langchain_core.messages import HumanMessage
 import json
 import asyncio
+from datetime import datetime
 from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.db.models import ChatSession, ChatMessage
 from langchain_core.messages import AIMessage
 from pydantic import BaseModel
+
+
+def _make_session_title(message: str, max_len: int = 60) -> str:
+    """Derive a human-readable session title from the user's first message."""
+    text = message.strip()
+    if len(text) <= max_len:
+        return text
+    # Cut at last space before limit so we don't break mid-word
+    truncated = text[:max_len].rsplit(" ", 1)[0]
+    return truncated + "…"
 
 router = APIRouter()
 
@@ -41,6 +52,38 @@ async def get_chat_history(session_id: str, db: Session = Depends(get_db)):
         for m in messages
     ]
 
+
+class RenameRequest(BaseModel):
+    title: str
+
+
+@router.patch("/sessions/{session_id}")
+async def rename_session(session_id: str, body: RenameRequest, db: Session = Depends(get_db)):
+    """
+    Renames a chat session by updating its title.
+    """
+    chat_session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+    if not chat_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    chat_session.title = body.title.strip() or chat_session.title
+    chat_session.updated_at = datetime.utcnow()
+    db.commit()
+    return {"id": chat_session.id, "title": chat_session.title}
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_session(session_id: str, db: Session = Depends(get_db)):
+    """
+    Deletes a chat session and all its messages (cascade handled by relationship).
+    """
+    chat_session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+    if not chat_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    db.delete(chat_session)
+    db.commit()
+    return {"deleted": session_id}
+
+
 @router.post("/chat")
 async def chat_with_agent(
     request: ChatRequest,
@@ -51,8 +94,10 @@ async def chat_with_agent(
     
     # 1. Fetch or Create Session
     chat_session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
-    if not chat_session:
-        chat_session = ChatSession(id=session_id)
+    is_new_session = chat_session is None
+    if is_new_session:
+        title = _make_session_title(message)
+        chat_session = ChatSession(id=session_id, title=title)
         db.add(chat_session)
         db.commit()
 
@@ -86,7 +131,8 @@ async def chat_with_agent(
         # Save AI Message (only if we got content)
         if final_ai_content:
             db.add(ChatMessage(session_id=session_id, role="ai", content=final_ai_content))
-        
+        # Refresh session timestamp so sidebar stays sorted by latest activity
+        chat_session.updated_at = datetime.utcnow()
         db.commit()
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
